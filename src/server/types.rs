@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Hash, Eq)]
 pub struct MySocketAddr(u16);
@@ -22,4 +23,11 @@ impl From<SocketAddr> for MySocketAddr {
         }
         Self(value.port())
     }
+}
+
+#[derive(Debug,Deserialize)]
+pub struct ServerConfig{
+    pub server_port: u16,
+    pub server_forward_port_start: u16,
+    pub server_forward_port_end: u16,
 }

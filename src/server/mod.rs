@@ -1,10 +1,10 @@
 mod conn;
-mod types;
+pub mod types;
 
 use crate::server::conn::{ClientConn, UserConn};
-use crate::server::types::MySocketAddr;
+use crate::server::types::{MySocketAddr, ServerConfig};
+use crate::util::load_config;
 use anyhow::bail;
-use dotenv_codegen::dotenv;
 use std::collections::HashMap;
 use std::error::Error;
 use std::hash::Hash;
@@ -17,13 +17,10 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::{net, select};
 use tracing::{debug, error, info, instrument, warn};
 
-static CURRENT_TRY_PORT: LazyLock<Mutex<u16>> = LazyLock::new(|| {
-    Mutex::new(
-        dotenv!("SERVER_FORWARD_PORT_START")
-            .parse()
-            .unwrap_or(20000),
-    )
-});
+static SERVER_CONFIG: LazyLock<ServerConfig> =
+    LazyLock::new(|| load_config::<ServerConfig>().unwrap());
+static CURRENT_TRY_PORT: LazyLock<Mutex<u16>> =
+    LazyLock::new(|| Mutex::new(SERVER_CONFIG.server_forward_port_start));
 #[derive(Clone, Debug)]
 pub struct Server {
     client_last_port: Arc<Mutex<HashMap<IpAddr, u16>>>,
@@ -37,7 +34,7 @@ impl Server {
         }
     }
     pub async fn start_listening(&self) -> anyhow::Result<()> {
-        let port = dotenv!("SERVER_PORT");
+        let port = SERVER_CONFIG.server_port;
         let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
         debug!(port, "Start listening");
         loop {
@@ -150,7 +147,7 @@ impl Server {
                                 conn_guard.write_u64(user_id).await?;
                                 conn_guard.write_u64(n as u64).await?;
                                 let data = &buf[0..n];
-                                debug!(data,user_id,"User data");
+                                debug!(data, user_id, "User data");
                                 conn_guard.write_all(data).await?;
                             }
                             Ok(())
@@ -174,10 +171,8 @@ impl Server {
         *next
     }
     async fn get_tcp_listener(prefer_port: Option<u16>) -> anyhow::Result<TcpListener> {
-        let min_port = dotenv!("SERVER_FORWARD_PORT_START")
-            .parse()
-            .unwrap_or(20000);
-        let max_port = dotenv!("SERVER_FORWARD_PORT_END").parse().unwrap_or(30000);
+        let min_port = SERVER_CONFIG.server_forward_port_start;
+        let max_port = SERVER_CONFIG.server_forward_port_end;
         let mut current_try_port = CURRENT_TRY_PORT.lock().await;
         let try_fn = async |port: u16| -> anyhow::Result<TcpListener> {
             Ok(TcpListener::bind(format!("0.0.0.0:{}", port)).await?)
