@@ -86,13 +86,13 @@ impl Server {
         tokio::spawn(async move {
             let _ = (async move || -> anyhow::Result<()> {
                 loop {
-                    let mut buf = vec![0; 1024 * 1024];
+                    let mut buf = vec![0; 1024];
                     let user_id = client_read.read_u64().await?.into();
                     let len = client_read.read_u64().await?;
                     buf.resize(len as usize, 0);
                     client_read.read_exact(&mut buf).await?;
                     if let Some(user_conn) = user_conn_map_clone.lock().await.get_mut(&user_id) {
-                        user_conn.write_stream.write_all(&buf).await?;
+                        let _ = user_conn.write_stream.write_all(&buf).await;
                     } else {
                         warn!(?user_id,ip=%client_conn.socket_addr.ip(),"Cannot find");
                     }
@@ -123,12 +123,15 @@ impl Server {
                         user_id,
                     };
                     user_conn_map.lock().await.insert(user_id, user_conn);
+                    let user_conn_map_clone = user_conn_map.clone();
                     let client_write_clone = client_write.clone();
                     let mut exit_rx = exit_tx.subscribe();
+                    client_write.lock().await.write_u64(user_id).await?;
+                    client_write.lock().await.write_u64(0u64).await?;
                     tokio::spawn(async move {
                         info!("Accept user {} on port {}", user_addr, assigned_port);
                         let _ = (async move || -> anyhow::Result<()> {
-                            let mut buf = vec![0; 1024 * 1024];
+                            let mut buf = vec![0; 1024];
                             let mut n: usize;
                             loop {
                                 select! {
@@ -146,12 +149,15 @@ impl Server {
                                 let mut conn_guard = client_write_clone.lock().await;
                                 conn_guard.write_u64(user_id).await?;
                                 conn_guard.write_u64(n as u64).await?;
-                                conn_guard.write_all(&buf[0..n]).await?;
+                                let data = &buf[0..n];
+                                debug!(data,user_id,"User data");
+                                conn_guard.write_all(data).await?;
                             }
                             Ok(())
                         })()
                         .await;
                         info!("Close user {} on port {}", user_addr, assigned_port);
+                        user_conn_map_clone.lock().await.remove(&user_id);
                         Ok::<(), anyhow::Error>(())
                     });
                 }
