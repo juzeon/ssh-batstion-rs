@@ -17,6 +17,7 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::{Mutex, RwLock};
 use tokio::{net, select};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 static SERVER_CONFIG: LazyLock<ServerConfig> =
@@ -75,10 +76,10 @@ impl Server {
         client_write.lock().await.write_u16(assigned_port).await?;
 
         let user_conn_map: Arc<Mutex<HashMap<u64, UserConn>>> = Default::default();
-        let (exit_tx, _) = tokio::sync::broadcast::channel::<bool>(1);
+        let cancel_token = CancellationToken::new();
 
         let user_conn_map_clone = user_conn_map.clone();
-        let exit_tx_clone = exit_tx.clone();
+        let cancel_token_clone = cancel_token.clone();
         let self_clone = self.clone();
         tokio::spawn(async move {
             if let Err(err) = self_clone
@@ -93,17 +94,17 @@ impl Server {
             } else {
                 warn!(%client_conn.socket_addr,assigned_port,"Client exited without error");
             }
-            let _ = exit_tx_clone.send(true);
+            cancel_token_clone.cancel();
         });
 
         loop {
-            let mut exit_rx_clone = exit_tx.subscribe();
+            let cancel_token_clone = cancel_token.clone();
             let res;
             select! {
                 r=forward_listener.accept()=>{
                     res=r;
                 },
-                _=exit_rx_clone.recv()=>{
+                _=cancel_token_clone.cancelled()=>{
                     warn!("Exit forward listener because of exit_rx");
                     break;
                 }
@@ -126,7 +127,7 @@ impl Server {
 
                     let user_conn_map_clone = user_conn_map.clone();
                     let client_write_clone = client_write.clone();
-                    let exit_rx_clone = exit_tx.subscribe();
+                    let cancel_token_clone = cancel_token.clone();
                     let self_clone = self.clone();
                     tokio::spawn(async move {
                         if let Err(err) = self_clone
@@ -134,7 +135,7 @@ impl Server {
                                 user_id,
                                 client_write_clone,
                                 user_read,
-                                exit_rx_clone,
+                                cancel_token_clone,
                             )
                             .await
                         {
@@ -157,7 +158,7 @@ impl Server {
         user_id: u64,
         client_write: Arc<Mutex<OwnedWriteHalf>>,
         mut user_read: OwnedReadHalf,
-        mut exit_rx: Receiver<bool>,
+        cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
         let mut buf = vec![0; 1024];
         let mut n: usize;
@@ -166,7 +167,7 @@ impl Server {
                 a=user_read.read(&mut buf)=>{
                     n=a?;
                 },
-                _=exit_rx.recv()=>{
+                _=cancel_token.cancelled()=>{
                     warn!(?user_id,"Exit user connection because the client has exited");
                     break;
                 }
