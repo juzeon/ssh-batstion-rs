@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -44,13 +44,8 @@ impl Client {
                 let _ = stream.writer.write_all(&read_buf.clone()).await;
             } else {
                 drop(forward_stream_map);
-                match self.connect_local_stream(user_id, read_buf.clone()).await {
-                    Ok(_) => {
-                        info!(user_id, "Successfully connected to local stream")
-                    }
-                    Err(err) => {
-                        warn!(%err,user_id, "Error connecting to local stream");
-                    }
+                if let Err(err) = self.connect_local_stream(user_id, read_buf.clone()).await {
+                    warn!(%err,user_id, "Error connecting to local stream");
                 }
             }
         }
@@ -58,7 +53,7 @@ impl Client {
     async fn connect_local_stream(&self, user_id: u64, init_data: Vec<u8>) -> anyhow::Result<()> {
         info!("Connecting to local stream");
         let local_stream = TcpStream::connect(CLIENT_CONFIG.client_local_addr.clone()).await?;
-        let (mut local_reader, mut local_writer) = local_stream.into_split();
+        let (local_reader, mut local_writer) = local_stream.into_split();
         local_writer.write_all(&init_data).await?;
         self.forward_stream_map.lock().await.insert(
             user_id,
@@ -69,25 +64,33 @@ impl Client {
         );
         let mut self_clone = self.clone();
         tokio::spawn(async move {
-            let mut f = async move || -> anyhow::Result<()> {
-                let mut buf = vec![0; 1024];
-                loop {
-                    let n = local_reader.read(&mut buf).await?;
-                    if n == 0 {
-                        warn!(user_id, "Local stream exited because read = 0");
-                        break;
-                    }
-                    let mut writer = self_clone.remote_write.as_mut().unwrap().lock().await;
-                    writer.write_u64(user_id).await?;
-                    writer.write_u64(n as u64).await?;
-                    writer.write_all(&buf[0..n]).await?;
-                }
-                Ok(())
-            };
-            if let Err(err) = f().await {
+            if let Err(err) = self_clone
+                .local_stream_to_remote(user_id, local_reader)
+                .await
+            {
                 error!(%err,user_id,"Local stream error");
             }
         });
+        info!(user_id, "Successfully connected to local stream");
+        Ok(())
+    }
+    async fn local_stream_to_remote(
+        &mut self,
+        user_id: u64,
+        mut local_reader: OwnedReadHalf,
+    ) -> anyhow::Result<()> {
+        let mut buf = vec![0; 1024];
+        loop {
+            let n = local_reader.read(&mut buf).await?;
+            if n == 0 {
+                warn!(user_id, "Local stream exited because read = 0");
+                break;
+            }
+            let mut writer = self.remote_write.as_mut().unwrap().lock().await;
+            writer.write_u64(user_id).await?;
+            writer.write_u64(n as u64).await?;
+            writer.write_all(&buf[0..n]).await?;
+        }
         Ok(())
     }
 }

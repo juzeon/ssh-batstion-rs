@@ -12,7 +12,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::ptr::hash;
 use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::sync::broadcast::Receiver;
 use tokio::sync::{Mutex, RwLock};
 use tokio::{net, select};
 use tracing::{debug, error, info, instrument, warn};
@@ -36,77 +38,72 @@ impl Server {
     pub async fn start_listening(&self) -> anyhow::Result<()> {
         let port = SERVER_CONFIG.server_port;
         let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-        debug!(port, "Start listening");
+        info!(port, "Start listening");
         loop {
             match listener.accept().await {
                 Ok(res) => {
                     let self_clone = self.clone();
-                    info!("spawn");
                     tokio::spawn(async move {
                         let res = self_clone
-                            .process_client_socket(ClientConn {
+                            .process_client_connection(ClientConn {
                                 tcp_stream: res.0,
                                 socket_addr: res.1,
                             })
                             .await;
                         if let Err(err) = res {
-                            error!(?err, "Error process socket");
+                            error!(%err, "Error process client connection");
                         }
                     });
                 }
                 Err(err) => {
-                    error!(?err, "Cannot accept")
+                    error!(%err, "Cannot accept client connection")
                 }
             }
         }
     }
-    async fn process_client_socket(&self, client_conn: ClientConn) -> anyhow::Result<()> {
-        info!(?client_conn, "Accept conn");
-        let mut guard = self.client_last_port.lock().await;
-        let client_last_port = guard.get(&client_conn.socket_addr.ip());
-        let forward_listener = Self::get_tcp_listener(client_last_port.cloned()).await?;
-        guard.insert(
-            client_conn.socket_addr.ip(),
-            forward_listener.local_addr()?.port(),
-        );
-        drop(guard);
+    async fn process_client_connection(&self, client_conn: ClientConn) -> anyhow::Result<()> {
+        info!(?client_conn, "Accepted client connection");
+        let forward_listener = self
+            .get_forward_tcp_listener_for_client(&client_conn)
+            .await?;
         let assigned_port = forward_listener.local_addr()?.port();
-        info!(ip=%client_conn.socket_addr.ip(),port=%assigned_port,
-            "Assigned forward port");
-        let (mut client_read, client_write) = client_conn.tcp_stream.into_split();
+        info!(?client_conn,%assigned_port,"Assigned remote port for client");
+
+        let (client_read, client_write) = client_conn.tcp_stream.into_split();
         let client_write = Arc::new(Mutex::new(client_write));
+
         client_write.lock().await.write_u16(assigned_port).await?;
+
         let user_conn_map: Arc<Mutex<HashMap<u64, UserConn>>> = Default::default();
         let (exit_tx, _) = tokio::sync::broadcast::channel::<bool>(1);
+
         let user_conn_map_clone = user_conn_map.clone();
         let exit_tx_clone = exit_tx.clone();
+        let self_clone = self.clone();
         tokio::spawn(async move {
-            let _ = (async move || -> anyhow::Result<()> {
-                loop {
-                    let mut buf = vec![0; 1024];
-                    let user_id = client_read.read_u64().await?.into();
-                    let len = client_read.read_u64().await?;
-                    buf.resize(len as usize, 0);
-                    client_read.read_exact(&mut buf).await?;
-                    if let Some(user_conn) = user_conn_map_clone.lock().await.get_mut(&user_id) {
-                        let _ = user_conn.write_stream.write_all(&buf).await;
-                    } else {
-                        warn!(?user_id,ip=%client_conn.socket_addr.ip(),"Cannot find");
-                    }
-                }
-            })()
-            .await;
-            warn!("client_read exit");
+            if let Err(err) = self_clone
+                .client_stream_to_user(
+                    client_conn.socket_addr.clone(),
+                    client_read,
+                    user_conn_map_clone,
+                )
+                .await
+            {
+                warn!(%err,%client_conn.socket_addr,assigned_port,"Client exited");
+            } else {
+                warn!(%client_conn.socket_addr,assigned_port,"Client exited without error");
+            }
             let _ = exit_tx_clone.send(true);
         });
+
         loop {
-            let mut exit_rx = exit_tx.subscribe();
+            let mut exit_rx_clone = exit_tx.subscribe();
             let res;
             select! {
                 r=forward_listener.accept()=>{
                     res=r;
                 },
-                _=exit_rx.recv()=>{
+                _=exit_rx_clone.recv()=>{
                     warn!("Exit forward listener because of exit_rx");
                     break;
                 }
@@ -114,48 +111,38 @@ impl Server {
             match res {
                 Ok((tcp_stream, user_addr)) => {
                     let user_id = self.get_next_user_id().await;
+                    info!(%user_addr,%client_conn.socket_addr,user_id,assigned_port,"Accept user connection");
                     let (mut user_read, user_write) = tcp_stream.into_split();
                     let user_conn = UserConn {
                         write_stream: user_write,
                         user_id,
                     };
                     user_conn_map.lock().await.insert(user_id, user_conn);
+                    // make the client establish a connection to their local stream
+                    let mut client_write_mu = client_write.lock().await;
+                    client_write_mu.write_u64(user_id).await?;
+                    client_write_mu.write_u64(0u64).await?;
+                    drop(client_write_mu);
+
                     let user_conn_map_clone = user_conn_map.clone();
                     let client_write_clone = client_write.clone();
-                    let mut exit_rx = exit_tx.subscribe();
-                    client_write.lock().await.write_u64(user_id).await?;
-                    client_write.lock().await.write_u64(0u64).await?;
+                    let exit_rx_clone = exit_tx.subscribe();
+                    let self_clone = self.clone();
                     tokio::spawn(async move {
-                        info!("Accept user {} on port {}", user_addr, assigned_port);
-                        let _ = (async move || -> anyhow::Result<()> {
-                            let mut buf = vec![0; 1024];
-                            let mut n: usize;
-                            loop {
-                                select! {
-                                    a=user_read.read(&mut buf)=>{
-                                        n=a?;
-                                    },
-                                    _=exit_rx.recv()=>{
-                                        warn!(?user_addr,"Exit user because of exit_rx");
-                                        break;
-                                    }
-                                }
-                                if n == 0 {
-                                    break;
-                                }
-                                let mut conn_guard = client_write_clone.lock().await;
-                                conn_guard.write_u64(user_id).await?;
-                                conn_guard.write_u64(n as u64).await?;
-                                let data = &buf[0..n];
-                                debug!(data, user_id, "User data");
-                                conn_guard.write_all(data).await?;
-                            }
-                            Ok(())
-                        })()
-                        .await;
-                        info!("Close user {} on port {}", user_addr, assigned_port);
+                        if let Err(err) = self_clone
+                            .user_stream_to_client(
+                                user_id,
+                                client_write_clone,
+                                user_read,
+                                exit_rx_clone,
+                            )
+                            .await
+                        {
+                            warn!(%err,user_id,assigned_port,"User connection error")
+                        } else {
+                            info!(assigned_port, user_id, "Closed user connection");
+                        }
                         user_conn_map_clone.lock().await.remove(&user_id);
-                        Ok::<(), anyhow::Error>(())
                     });
                 }
                 Err(err) => {
@@ -165,20 +152,76 @@ impl Server {
         }
         Ok(())
     }
+    async fn user_stream_to_client(
+        &self,
+        user_id: u64,
+        client_write: Arc<Mutex<OwnedWriteHalf>>,
+        mut user_read: OwnedReadHalf,
+        mut exit_rx: Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let mut buf = vec![0; 1024];
+        let mut n: usize;
+        loop {
+            select! {
+                a=user_read.read(&mut buf)=>{
+                    n=a?;
+                },
+                _=exit_rx.recv()=>{
+                    warn!(?user_id,"Exit user connection because the client has exited");
+                    break;
+                }
+            }
+            if n == 0 {
+                break;
+            }
+            let mut client_write_mu = client_write.lock().await;
+            client_write_mu.write_u64(user_id).await?;
+            client_write_mu.write_u64(n as u64).await?;
+            let data = &buf[0..n];
+            client_write_mu.write_all(data).await?;
+        }
+        Ok(())
+    }
+    async fn client_stream_to_user(
+        &self,
+        client_socket_addr: SocketAddr,
+        mut client_read: OwnedReadHalf,
+        user_conn_map: Arc<Mutex<HashMap<u64, UserConn>>>,
+    ) -> anyhow::Result<()> {
+        loop {
+            let mut buf = vec![0; 1024];
+            let user_id = client_read.read_u64().await?.into();
+            let len = client_read.read_u64().await?;
+            buf.resize(len as usize, 0);
+            client_read.read_exact(&mut buf).await?;
+            if let Some(user_conn) = user_conn_map.lock().await.get_mut(&user_id) {
+                if let Err(err) = user_conn.write_stream.write_all(&buf).await {
+                    error!(%err,user_id,%client_socket_addr,"Cannot write to user stream");
+                }
+            } else {
+                warn!(?user_id,%client_socket_addr,"Cannot find connection by user id from map");
+            }
+        }
+    }
     async fn get_next_user_id(&self) -> u64 {
         let mut next = self.next_user_id.lock().await;
         *next += 1;
         *next
     }
-    async fn get_tcp_listener(prefer_port: Option<u16>) -> anyhow::Result<TcpListener> {
+    async fn get_forward_tcp_listener_for_client(
+        &self,
+        client_conn: &ClientConn,
+    ) -> anyhow::Result<TcpListener> {
+        let mut client_last_port_mu = self.client_last_port.lock().await;
+        let client_last_port = client_last_port_mu.get(&client_conn.socket_addr.ip());
         let min_port = SERVER_CONFIG.server_forward_port_start;
         let max_port = SERVER_CONFIG.server_forward_port_end;
         let mut current_try_port = CURRENT_TRY_PORT.lock().await;
         let try_fn = async |port: u16| -> anyhow::Result<TcpListener> {
             Ok(TcpListener::bind(format!("0.0.0.0:{}", port)).await?)
         };
-        if let Some(port) = prefer_port {
-            if let Ok(res) = try_fn(port).await {
+        if let Some(port) = client_last_port {
+            if let Ok(res) = try_fn(*port).await {
                 return Ok(res);
             }
         }
@@ -192,7 +235,11 @@ impl Server {
                 bail!("cannot get a available port");
             }
             match try_fn(*current_try_port).await {
-                Ok(res) => return Ok(res),
+                Ok(res) => {
+                    client_last_port_mu
+                        .insert(client_conn.socket_addr.ip(), res.local_addr()?.port());
+                    return Ok(res);
+                }
                 Err(_) => continue,
             }
         }
