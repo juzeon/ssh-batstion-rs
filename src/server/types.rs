@@ -1,5 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use serde::Deserialize;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::TcpStream;
 
 #[derive(Clone, Copy, Debug, PartialEq, Hash, Eq)]
 pub struct MySocketAddr(u16);
@@ -30,4 +32,16 @@ pub struct ServerConfig{
     pub server_port: u16,
     pub server_forward_port_start: u16,
     pub server_forward_port_end: u16,
+}
+
+#[derive(Debug)]
+pub struct ClientConn {
+    pub tcp_stream: TcpStream,
+    pub socket_addr: SocketAddr,
+}
+
+#[derive(Debug)]
+pub struct UserConn {
+    pub write_stream: OwnedWriteHalf,
+    pub user_id: u64,
 }

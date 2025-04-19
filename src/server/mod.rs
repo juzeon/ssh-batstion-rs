@@ -1,8 +1,7 @@
-mod conn;
 pub mod types;
 
-use crate::server::conn::{ClientConn, UserConn};
-use crate::server::types::{MySocketAddr, ServerConfig};
+use crate::server::types::{ClientConn, MySocketAddr, ServerConfig, UserConn};
+use crate::types::{TunnelMessage, TunnelMessageData};
 use crate::util::load_config;
 use anyhow::bail;
 use std::collections::HashMap;
@@ -121,8 +120,11 @@ impl Server {
                     user_conn_map.lock().await.insert(user_id, user_conn);
                     // make the client establish a connection to their local stream
                     let mut client_write_mu = client_write.lock().await;
-                    client_write_mu.write_u64(user_id).await?;
-                    client_write_mu.write_u64(0u64).await?;
+                    TunnelMessage::Data(TunnelMessageData { user_id, len: 0 })
+                        .write(&mut client_write_mu, &vec![])
+                        .await?;
+                    // client_write_mu.write_u64(user_id).await?;
+                    // client_write_mu.write_u64(0u64).await?;
                     drop(client_write_mu);
 
                     let user_conn_map_clone = user_conn_map.clone();
@@ -139,7 +141,7 @@ impl Server {
                             )
                             .await
                         {
-                            warn!(%err,user_id,assigned_port,"User connection error")
+                            warn!(%err,user_id,assigned_port,"User connection error (closed)")
                         } else {
                             info!(assigned_port, user_id, "Closed user connection");
                         }
@@ -176,10 +178,16 @@ impl Server {
                 break;
             }
             let mut client_write_mu = client_write.lock().await;
-            client_write_mu.write_u64(user_id).await?;
-            client_write_mu.write_u64(n as u64).await?;
-            let data = &buf[0..n];
-            client_write_mu.write_all(data).await?;
+            TunnelMessage::Data(TunnelMessageData {
+                user_id,
+                len: n as u64,
+            })
+            .write(&mut client_write_mu, &buf)
+            .await?;
+            // client_write_mu.write_u64(user_id).await?;
+            // client_write_mu.write_u64(n as u64).await?;
+            // let data = &buf[0..n];
+            // client_write_mu.write_all(data).await?;
         }
         Ok(())
     }
@@ -189,18 +197,25 @@ impl Server {
         mut client_read: OwnedReadHalf,
         user_conn_map: Arc<Mutex<HashMap<u64, UserConn>>>,
     ) -> anyhow::Result<()> {
+        let mut buf = vec![0; 1024];
         loop {
-            let mut buf = vec![0; 1024];
-            let user_id = client_read.read_u64().await?.into();
-            let len = client_read.read_u64().await?;
-            buf.resize(len as usize, 0);
-            client_read.read_exact(&mut buf).await?;
-            if let Some(user_conn) = user_conn_map.lock().await.get_mut(&user_id) {
-                if let Err(err) = user_conn.write_stream.write_all(&buf).await {
-                    error!(%err,user_id,%client_socket_addr,"Cannot write to user stream");
+            // let user_id = client_read.read_u64().await?.into();
+            // let len = client_read.read_u64().await?;
+            // buf.resize(len as usize, 0);
+            // client_read.read_exact(&mut buf).await?;
+            match TunnelMessage::read(&mut client_read, &mut buf).await? {
+                TunnelMessage::Close(c) => {
+                    // TODO handle close
                 }
-            } else {
-                warn!(?user_id,%client_socket_addr,"Cannot find connection by user id from map");
+                TunnelMessage::Data(d) => {
+                    if let Some(user_conn) = user_conn_map.lock().await.get_mut(&d.user_id) {
+                        if let Err(err) = user_conn.write_stream.write_all(&buf).await {
+                            error!(%err,d.user_id,%client_socket_addr,"Cannot write to user stream");
+                        }
+                    } else {
+                        warn!(?d.user_id,%client_socket_addr,"Cannot find connection by user id from map");
+                    }
+                }
             }
         }
     }

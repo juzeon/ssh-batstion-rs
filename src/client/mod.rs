@@ -1,6 +1,7 @@
 pub mod types;
 
 use crate::client::types::{ClientConfig, ForwardStream};
+use crate::types::{TunnelMessage, TunnelMessageData};
 use crate::util::load_config;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -35,17 +36,26 @@ impl Client {
         self.remote_write = Some(Arc::new(Mutex::new(remote_write)));
         let mut read_buf = vec![0; 1024];
         loop {
-            let user_id = remote_read.read_u64().await?;
-            let len = remote_read.read_u64().await?;
-            read_buf.resize(len as usize, 0);
-            remote_read.read_exact(&mut read_buf).await?;
-            let mut forward_stream_map = self.forward_stream_map.lock().await;
-            if let Some(stream) = forward_stream_map.get_mut(&user_id) {
-                let _ = stream.writer.write_all(&read_buf.clone()).await;
-            } else {
-                drop(forward_stream_map);
-                if let Err(err) = self.connect_local_stream(user_id, read_buf.clone()).await {
-                    warn!(%err,user_id, "Error connecting to local stream");
+            // let user_id = remote_read.read_u64().await?;
+            // let len = remote_read.read_u64().await?;
+            // read_buf.resize(len as usize, 0);
+            // remote_read.read_exact(&mut read_buf).await?;
+            match TunnelMessage::read(&mut remote_read, &mut read_buf).await? {
+                TunnelMessage::Close(c) => {
+                    // TODO handle close
+                }
+                TunnelMessage::Data(d) => {
+                    let mut forward_stream_map = self.forward_stream_map.lock().await;
+                    if let Some(stream) = forward_stream_map.get_mut(&d.user_id) {
+                        let _ = stream.writer.write_all(&read_buf.clone()).await;
+                    } else {
+                        drop(forward_stream_map);
+                        if let Err(err) =
+                            self.connect_local_stream(d.user_id, read_buf.clone()).await
+                        {
+                            warn!(%err,d.user_id, "Error connecting to local stream");
+                        }
+                    }
                 }
             }
         }
@@ -87,9 +97,15 @@ impl Client {
                 break;
             }
             let mut writer = self.remote_write.as_mut().unwrap().lock().await;
-            writer.write_u64(user_id).await?;
-            writer.write_u64(n as u64).await?;
-            writer.write_all(&buf[0..n]).await?;
+            TunnelMessage::Data(TunnelMessageData {
+                user_id,
+                len: n as u64,
+            })
+            .write(&mut writer, &buf)
+            .await?;
+            // writer.write_u64(user_id).await?;
+            // writer.write_u64(n as u64).await?;
+            // writer.write_all(&buf[0..n]).await?;
         }
         Ok(())
     }
