@@ -3,6 +3,7 @@ pub mod types;
 use crate::client::types::{ClientConfig, LocalStream};
 use crate::types::{TunnelMessage, TunnelMessageClose, TunnelMessageData};
 use crate::util::{EMPTY_U8_VEC, load_config};
+use anyhow::Context;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -47,19 +48,21 @@ impl Client {
         }
     }
     pub async fn start_forwarding(&mut self) -> anyhow::Result<()> {
-        let mut stream = TcpStream::connect(CLIENT_CONFIG.client_server_addr.clone()).await?;
-        let remote_port = stream.read_u16().await?;
+        let mut remote_stream =
+            TcpStream::connect(CLIENT_CONFIG.client_server_addr.clone()).await?;
+        let remote_port = remote_stream.read_u16().await?;
         self.remote_port = remote_port;
         info!(remote_port, "Connected to remote");
-        let (mut remote_read, remote_write) = stream.into_split();
+        let (mut remote_read, remote_write) = remote_stream.into_split();
         self.remote_write = Some(Arc::new(Mutex::new(remote_write)));
         let mut read_buf = vec![0; 1024];
         loop {
+            // tunnel to local stream
             match TunnelMessage::read(&mut remote_read, &mut read_buf).await? {
                 TunnelMessage::Close(c) => {
                     let mut local_stream_map_mu = self.local_stream_map.lock().await;
                     if let Some(stream) = local_stream_map_mu.get_mut(&c.user_id) {
-                        info!(c.user_id, "Notify user stream to cancel");
+                        warn!(c.user_id, "Notify local stream to cancel");
                         stream.cancel.cancel();
                         local_stream_map_mu.remove(&c.user_id);
                     }
@@ -82,7 +85,7 @@ impl Client {
         }
     }
     async fn establish_local_stream(&self, user_id: u64, init_data: Vec<u8>) -> anyhow::Result<()> {
-        info!("Connecting to local stream");
+        info!(user_id, "Connecting to local stream");
         let local_stream = TcpStream::connect(CLIENT_CONFIG.client_local_addr.clone()).await?;
         let (local_reader, mut local_writer) = local_stream.into_split();
         local_writer.write_all(&init_data).await?;
@@ -106,6 +109,7 @@ impl Client {
             {
                 error!(%err,user_id,"Local stream error");
             }
+            self_clone.local_stream_map.lock().await.remove(&user_id);
         });
         info!(user_id, "Successfully connected to local stream");
         Ok(())
@@ -118,21 +122,27 @@ impl Client {
     ) -> anyhow::Result<()> {
         let mut buf = vec![0; 1024];
         loop {
-            let n: usize;
+            let n: anyhow::Result<usize>;
             select! {
                 res=local_reader.read(&mut buf)=>{
-                    n=res?
+                    n=res.context("read failed")
                 }
                 _=cancel_token.cancelled()=>{
                     info!(user_id,"Exiting local stream because of cancel token");
                     break;
                 }
             }
-            let mut writer = self.remote_write.as_mut().unwrap().lock().await;
+            let mut writer = self
+                .remote_write
+                .as_mut()
+                .context("self.remote_write is None")?
+                .lock()
+                .await;
+            let n = n.unwrap_or(0);
             if n == 0 {
                 warn!(
                     user_id,
-                    "Local stream exited because read = 0, notifying tunnel to close their user"
+                    "Local stream exited because read failed, notifying tunnel to close their user"
                 );
                 TunnelMessage::Close(TunnelMessageClose { user_id })
                     .write(&mut writer, &EMPTY_U8_VEC)

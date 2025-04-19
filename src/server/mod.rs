@@ -1,9 +1,9 @@
 pub mod types;
 
 use crate::server::types::{ClientConn, MySocketAddr, ServerConfig, UserConn};
-use crate::types::{TunnelMessage, TunnelMessageData};
-use crate::util::{load_config, EMPTY_U8_VEC};
-use anyhow::bail;
+use crate::types::{TunnelMessage, TunnelMessageClose, TunnelMessageData};
+use crate::util::{EMPTY_U8_VEC, load_config};
+use anyhow::{Context, bail};
 use std::collections::HashMap;
 use std::error::Error;
 use std::hash::Hash;
@@ -45,7 +45,7 @@ impl Server {
                     let self_clone = self.clone();
                     tokio::spawn(async move {
                         let res = self_clone
-                            .process_client_connection(ClientConn {
+                            .accept_client_connection(ClientConn {
                                 tcp_stream: res.0,
                                 socket_addr: res.1,
                             })
@@ -61,7 +61,7 @@ impl Server {
             }
         }
     }
-    async fn process_client_connection(&self, client_conn: ClientConn) -> anyhow::Result<()> {
+    async fn accept_client_connection(&self, client_conn: ClientConn) -> anyhow::Result<()> {
         info!(?client_conn, "Accepted client connection");
         let forward_listener = self
             .get_forward_tcp_listener_for_client(&client_conn)
@@ -72,20 +72,21 @@ impl Server {
         let (client_read, client_write) = client_conn.tcp_stream.into_split();
         let client_write = Arc::new(Mutex::new(client_write));
 
+        // tell the assigned port to the client
         client_write.lock().await.write_u16(assigned_port).await?;
 
         let user_conn_map: Arc<Mutex<HashMap<u64, UserConn>>> = Default::default();
-        let cancel_token = CancellationToken::new();
+        let forward_listener_cancel_token = CancellationToken::new();
 
         let user_conn_map_clone = user_conn_map.clone();
-        let cancel_token_clone = cancel_token.clone();
         let self_clone = self.clone();
+        let forward_listener_cancel_token_clone = forward_listener_cancel_token.clone();
         tokio::spawn(async move {
             if let Err(err) = self_clone
-                .client_stream_to_user(
+                .tunnel_stream_to_user(
                     client_conn.socket_addr.clone(),
                     client_read,
-                    user_conn_map_clone,
+                    user_conn_map_clone.clone(),
                 )
                 .await
             {
@@ -93,18 +94,23 @@ impl Server {
             } else {
                 warn!(%client_conn.socket_addr,assigned_port,"Client exited without error");
             }
-            cancel_token_clone.cancel();
+            let mut user_conn_map_mu = user_conn_map_clone.lock().await;
+            for (_, item) in user_conn_map_mu.iter_mut() {
+                item.cancel_token.cancel();
+            }
+            *user_conn_map_mu = HashMap::new();
+            forward_listener_cancel_token_clone.cancel();
         });
 
         loop {
-            let cancel_token_clone = cancel_token.clone();
+            let forward_listener_cancel_token_clone = forward_listener_cancel_token.clone();
             let res;
             select! {
                 r=forward_listener.accept()=>{
                     res=r;
                 },
-                _=cancel_token_clone.cancelled()=>{
-                    warn!("Exit forward listener because of exit_rx");
+                _=forward_listener_cancel_token_clone.cancelled()=>{
+                    warn!("Exit forward listener because of forward_listener_cancel_token");
                     break;
                 }
             }
@@ -113,9 +119,11 @@ impl Server {
                     let user_id = self.get_next_user_id().await;
                     info!(%user_addr,%client_conn.socket_addr,user_id,assigned_port,"Accept user connection");
                     let (user_read, user_write) = tcp_stream.into_split();
+                    let cancel_token = CancellationToken::new();
                     let user_conn = UserConn {
                         write_stream: user_write,
                         user_id,
+                        cancel_token: cancel_token.clone(),
                     };
                     user_conn_map.lock().await.insert(user_id, user_conn);
                     // make the client establish a connection to their local stream
@@ -123,8 +131,6 @@ impl Server {
                     TunnelMessage::Data(TunnelMessageData { user_id, len: 0 })
                         .write(&mut client_write_mu, &EMPTY_U8_VEC)
                         .await?;
-                    // client_write_mu.write_u64(user_id).await?;
-                    // client_write_mu.write_u64(0u64).await?;
                     drop(client_write_mu);
 
                     let user_conn_map_clone = user_conn_map.clone();
@@ -133,7 +139,7 @@ impl Server {
                     let self_clone = self.clone();
                     tokio::spawn(async move {
                         if let Err(err) = self_clone
-                            .user_stream_to_client(
+                            .user_stream_to_tunnel(
                                 user_id,
                                 client_write_clone,
                                 user_read,
@@ -155,7 +161,7 @@ impl Server {
         }
         Ok(())
     }
-    async fn user_stream_to_client(
+    async fn user_stream_to_tunnel(
         &self,
         user_id: u64,
         client_write: Arc<Mutex<OwnedWriteHalf>>,
@@ -163,35 +169,39 @@ impl Server {
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
         let mut buf = vec![0; 1024];
-        let mut n: usize;
         loop {
+            let n: anyhow::Result<usize>;
             select! {
                 a=user_read.read(&mut buf)=>{
-                    n=a?;
+                    n=a.context("read failed");
                 },
                 _=cancel_token.cancelled()=>{
                     warn!(?user_id,"Exit user connection because the client has exited");
                     break;
                 }
             }
+            let mut client_write_mu = client_write.lock().await;
+            let n = n.unwrap_or(0);
             if n == 0 {
+                warn!(
+                    user_id,
+                    "User connection exited because read failed, notifying the tunnel to close their local stream"
+                );
+                TunnelMessage::Close(TunnelMessageClose { user_id })
+                    .write(&mut client_write_mu, &EMPTY_U8_VEC)
+                    .await?;
                 break;
             }
-            let mut client_write_mu = client_write.lock().await;
             TunnelMessage::Data(TunnelMessageData {
                 user_id,
                 len: n as u64,
             })
             .write(&mut client_write_mu, &buf)
             .await?;
-            // client_write_mu.write_u64(user_id).await?;
-            // client_write_mu.write_u64(n as u64).await?;
-            // let data = &buf[0..n];
-            // client_write_mu.write_all(data).await?;
         }
         Ok(())
     }
-    async fn client_stream_to_user(
+    async fn tunnel_stream_to_user(
         &self,
         client_socket_addr: SocketAddr,
         mut client_read: OwnedReadHalf,
@@ -199,13 +209,14 @@ impl Server {
     ) -> anyhow::Result<()> {
         let mut buf = vec![0; 1024];
         loop {
-            // let user_id = client_read.read_u64().await?.into();
-            // let len = client_read.read_u64().await?;
-            // buf.resize(len as usize, 0);
-            // client_read.read_exact(&mut buf).await?;
             match TunnelMessage::read(&mut client_read, &mut buf).await? {
                 TunnelMessage::Close(c) => {
-                    // TODO handle close
+                    let mut user_conn_map_mu = user_conn_map.lock().await;
+                    if let Some(user_conn) = user_conn_map_mu.get_mut(&c.user_id) {
+                        warn!(c.user_id, "Notify user connection to cancel");
+                        user_conn.cancel_token.cancel();
+                        user_conn_map_mu.remove(&c.user_id);
+                    }
                 }
                 TunnelMessage::Data(d) => {
                     if let Some(user_conn) = user_conn_map.lock().await.get_mut(&d.user_id) {

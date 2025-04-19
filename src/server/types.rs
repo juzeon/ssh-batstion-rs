@@ -1,7 +1,8 @@
-use std::net::{IpAddr, SocketAddr};
 use serde::Deserialize;
-use tokio::net::tcp::OwnedWriteHalf;
+use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Hash, Eq)]
 pub struct MySocketAddr(u16);
@@ -17,18 +18,16 @@ impl From<u16> for MySocketAddr {
 }
 impl From<SocketAddr> for MySocketAddr {
     fn from(value: SocketAddr) -> Self {
-        match value.ip(){
-            IpAddr::V4(v4) => {
-                
-            }
+        match value.ip() {
+            IpAddr::V4(v4) => {}
             IpAddr::V6(v6) => {}
         }
         Self(value.port())
     }
 }
 
-#[derive(Debug,Deserialize)]
-pub struct ServerConfig{
+#[derive(Debug, Deserialize)]
+pub struct ServerConfig {
     pub server_port: u16,
     pub server_forward_port_start: u16,
     pub server_forward_port_end: u16,
@@ -44,4 +43,5 @@ pub struct ClientConn {
 pub struct UserConn {
     pub write_stream: OwnedWriteHalf,
     pub user_id: u64,
+    pub cancel_token: CancellationToken,
 }
