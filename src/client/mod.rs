@@ -7,6 +7,7 @@ use anyhow::Context;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -16,7 +17,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-static CLIENT_CONFIG: LazyLock<ClientConfig> =
+pub static CLIENT_CONFIG: LazyLock<ClientConfig> =
     LazyLock::new(|| load_config::<ClientConfig>().unwrap());
 #[derive(Clone)]
 pub struct Client {
@@ -47,12 +48,26 @@ impl Client {
             sleep(Duration::from_secs(1)).await;
         }
     }
+    pub async fn update_ssh_info_file(&self, port: u16) {
+        let host = CLIENT_CONFIG.client_server_addr.split(":").nth(0).unwrap();
+        tokio::fs::write(
+            &CLIENT_CONFIG.client_ssh_info_file,
+            format!(
+                "SSH Config:\n\nHost: {}\nPort: {}\n\nCommand: ssh root@{} -p {}\n\n\
+                Please change your password using `passwd` command before making a connection.\n\n",
+                host, port, host, port
+            ),
+        )
+        .await
+        .unwrap();
+    }
     pub async fn start_forwarding(&mut self) -> anyhow::Result<()> {
         let mut remote_stream =
             TcpStream::connect(CLIENT_CONFIG.client_server_addr.clone()).await?;
         let remote_port = remote_stream.read_u16().await?;
         self.remote_port = remote_port;
         info!(remote_port, "Connected to remote");
+        self.update_ssh_info_file(remote_port).await;
         let (mut remote_read, remote_write) = remote_stream.into_split();
         self.remote_write = Some(Arc::new(Mutex::new(remote_write)));
         let mut read_buf = vec![0; 1024];

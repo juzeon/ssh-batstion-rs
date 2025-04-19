@@ -1,0 +1,21 @@
+version: "3"
+
+tasks:
+  compile-windows:
+    desc: Compile server and client to Windows x64 release
+    platform: windows
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    cmds:
+      - cargo build --release --target $TARGET --bin ssh-bastion-server
+      - cargo build --release --target $TARGET --bin ssh-bastion-client
+
+  compile-linux:
+    desc: Compile server and client to Linux x64 release
+    platform: linux
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    cmds:
+      - cargo zigbuild --release --target $TARGET --bin ssh-bastion-server
+      - cargo zigbuild --release --target $TARGET --bin ssh-bastion-client
+

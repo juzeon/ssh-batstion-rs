@@ -2,3 +2,5 @@
 .idea
 .env
 config.yml
+ssh-info.txt
+log.log

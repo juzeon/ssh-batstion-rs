@@ -4,6 +4,7 @@ use crate::server::types::{ClientConn, MySocketAddr, ServerConfig, UserConn};
 use crate::types::{TunnelMessage, TunnelMessageClose, TunnelMessageData};
 use crate::util::{EMPTY_U8_VEC, load_config};
 use anyhow::{Context, bail};
+use rand::Rng;
 use std::collections::HashMap;
 use std::error::Error;
 use std::hash::Hash;
@@ -19,10 +20,8 @@ use tokio::{net, select};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-static SERVER_CONFIG: LazyLock<ServerConfig> =
+pub static SERVER_CONFIG: LazyLock<ServerConfig> =
     LazyLock::new(|| load_config::<ServerConfig>().unwrap());
-static CURRENT_TRY_PORT: LazyLock<Mutex<u16>> =
-    LazyLock::new(|| Mutex::new(SERVER_CONFIG.server_forward_port_start));
 #[derive(Clone, Debug)]
 pub struct Server {
     client_last_port: Arc<Mutex<HashMap<IpAddr, u16>>>,
@@ -243,7 +242,7 @@ impl Server {
         let client_last_port = client_last_port_mu.get(&client_conn.socket_addr.ip());
         let min_port = SERVER_CONFIG.server_forward_port_start;
         let max_port = SERVER_CONFIG.server_forward_port_end;
-        let mut current_try_port = CURRENT_TRY_PORT.lock().await;
+        let mut current_try_port = rand::rng().random_range(min_port..max_port);
         let try_fn = async |port: u16| -> anyhow::Result<TcpListener> {
             Ok(TcpListener::bind(format!("0.0.0.0:{}", port)).await?)
         };
@@ -252,16 +251,16 @@ impl Server {
                 return Ok(res);
             }
         }
-        let try_start = *current_try_port;
+        let try_start = current_try_port;
         loop {
-            *current_try_port += 1;
-            if *current_try_port >= max_port {
-                *current_try_port = min_port
+            current_try_port += 1;
+            if current_try_port >= max_port {
+                current_try_port = min_port
             }
-            if *current_try_port == try_start {
+            if current_try_port == try_start {
                 bail!("cannot get a available port");
             }
-            match try_fn(*current_try_port).await {
+            match try_fn(current_try_port).await {
                 Ok(res) => {
                     client_last_port_mu
                         .insert(client_conn.socket_addr.ip(), res.local_addr()?.port());

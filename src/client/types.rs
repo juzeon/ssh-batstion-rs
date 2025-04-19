@@ -13,4 +13,5 @@ pub struct LocalStream {
 pub struct ClientConfig {
     pub client_server_addr: String,
     pub client_local_addr: String,
+    pub client_ssh_info_file: String,
 }
