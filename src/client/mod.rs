@@ -1,14 +1,18 @@
 pub mod types;
 
-use crate::client::types::{ClientConfig, ForwardStream};
-use crate::types::{TunnelMessage, TunnelMessageData};
-use crate::util::load_config;
+use crate::client::types::{ClientConfig, LocalStream};
+use crate::types::{TunnelMessage, TunnelMessageClose, TunnelMessageData};
+use crate::util::{EMPTY_U8_VEC, load_config};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::select;
 use tokio::sync::Mutex;
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 static CLIENT_CONFIG: LazyLock<ClientConfig> =
@@ -16,15 +20,30 @@ static CLIENT_CONFIG: LazyLock<ClientConfig> =
 #[derive(Clone)]
 pub struct Client {
     remote_port: u16,
-    forward_stream_map: Arc<Mutex<HashMap<u64, ForwardStream>>>,
+    local_stream_map: Arc<Mutex<HashMap<u64, LocalStream>>>,
     remote_write: Option<Arc<Mutex<OwnedWriteHalf>>>,
 }
 impl Client {
     pub fn new() -> Client {
         Client {
             remote_port: 0,
-            forward_stream_map: Default::default(),
+            local_stream_map: Default::default(),
             remote_write: None,
+        }
+    }
+    pub async fn start_forwarding_forever(&mut self) {
+        loop {
+            info!("start_forwarding_forever connecting");
+            if let Err(err) = self.start_forwarding().await {
+                error!(%err, "Start forwarding error");
+            }
+            self.remote_write = None;
+            self.remote_port = 0;
+            for (_, item) in self.local_stream_map.lock().await.iter_mut() {
+                item.cancel.cancel();
+            }
+            self.local_stream_map = Default::default();
+            sleep(Duration::from_secs(1)).await;
         }
     }
     pub async fn start_forwarding(&mut self) -> anyhow::Result<()> {
@@ -36,46 +55,53 @@ impl Client {
         self.remote_write = Some(Arc::new(Mutex::new(remote_write)));
         let mut read_buf = vec![0; 1024];
         loop {
-            // let user_id = remote_read.read_u64().await?;
-            // let len = remote_read.read_u64().await?;
-            // read_buf.resize(len as usize, 0);
-            // remote_read.read_exact(&mut read_buf).await?;
             match TunnelMessage::read(&mut remote_read, &mut read_buf).await? {
                 TunnelMessage::Close(c) => {
-                    // TODO handle close
+                    let mut local_stream_map_mu = self.local_stream_map.lock().await;
+                    if let Some(stream) = local_stream_map_mu.get_mut(&c.user_id) {
+                        info!(c.user_id, "Notify user stream to cancel");
+                        stream.cancel.cancel();
+                        local_stream_map_mu.remove(&c.user_id);
+                    }
                 }
                 TunnelMessage::Data(d) => {
-                    let mut forward_stream_map = self.forward_stream_map.lock().await;
-                    if let Some(stream) = forward_stream_map.get_mut(&d.user_id) {
+                    let mut local_stream_map_mu = self.local_stream_map.lock().await;
+                    if let Some(stream) = local_stream_map_mu.get_mut(&d.user_id) {
                         let _ = stream.writer.write_all(&read_buf.clone()).await;
                     } else {
-                        drop(forward_stream_map);
-                        if let Err(err) =
-                            self.connect_local_stream(d.user_id, read_buf.clone()).await
+                        drop(local_stream_map_mu);
+                        if let Err(err) = self
+                            .establish_local_stream(d.user_id, read_buf.clone())
+                            .await
                         {
-                            warn!(%err,d.user_id, "Error connecting to local stream");
+                            warn!(%err,d.user_id, "Error establishing local stream");
                         }
                     }
                 }
             }
         }
     }
-    async fn connect_local_stream(&self, user_id: u64, init_data: Vec<u8>) -> anyhow::Result<()> {
+    async fn establish_local_stream(&self, user_id: u64, init_data: Vec<u8>) -> anyhow::Result<()> {
         info!("Connecting to local stream");
         let local_stream = TcpStream::connect(CLIENT_CONFIG.client_local_addr.clone()).await?;
         let (local_reader, mut local_writer) = local_stream.into_split();
         local_writer.write_all(&init_data).await?;
-        self.forward_stream_map.lock().await.insert(
+
+        let cancel_token = CancellationToken::new();
+        let cancel_token_clone = cancel_token.clone();
+        self.local_stream_map.lock().await.insert(
             user_id,
-            ForwardStream {
+            LocalStream {
                 user_id,
                 writer: local_writer,
+                cancel: cancel_token,
             },
         );
+
         let mut self_clone = self.clone();
         tokio::spawn(async move {
             if let Err(err) = self_clone
-                .local_stream_to_remote(user_id, local_reader)
+                .local_stream_to_tunnel(user_id, local_reader, cancel_token_clone)
                 .await
             {
                 error!(%err,user_id,"Local stream error");
@@ -84,28 +110,41 @@ impl Client {
         info!(user_id, "Successfully connected to local stream");
         Ok(())
     }
-    async fn local_stream_to_remote(
+    async fn local_stream_to_tunnel(
         &mut self,
         user_id: u64,
         mut local_reader: OwnedReadHalf,
+        cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
         let mut buf = vec![0; 1024];
         loop {
-            let n = local_reader.read(&mut buf).await?;
-            if n == 0 {
-                warn!(user_id, "Local stream exited because read = 0");
-                break;
+            let n: usize;
+            select! {
+                res=local_reader.read(&mut buf)=>{
+                    n=res?
+                }
+                _=cancel_token.cancelled()=>{
+                    info!(user_id,"Exiting local stream because of cancel token");
+                    break;
+                }
             }
             let mut writer = self.remote_write.as_mut().unwrap().lock().await;
+            if n == 0 {
+                warn!(
+                    user_id,
+                    "Local stream exited because read = 0, notifying tunnel to close their user"
+                );
+                TunnelMessage::Close(TunnelMessageClose { user_id })
+                    .write(&mut writer, &EMPTY_U8_VEC)
+                    .await?;
+                break;
+            }
             TunnelMessage::Data(TunnelMessageData {
                 user_id,
                 len: n as u64,
             })
             .write(&mut writer, &buf)
             .await?;
-            // writer.write_u64(user_id).await?;
-            // writer.write_u64(n as u64).await?;
-            // writer.write_all(&buf[0..n]).await?;
         }
         Ok(())
     }

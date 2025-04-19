@@ -2,7 +2,7 @@ pub mod types;
 
 use crate::server::types::{ClientConn, MySocketAddr, ServerConfig, UserConn};
 use crate::types::{TunnelMessage, TunnelMessageData};
-use crate::util::load_config;
+use crate::util::{load_config, EMPTY_U8_VEC};
 use anyhow::bail;
 use std::collections::HashMap;
 use std::error::Error;
@@ -112,7 +112,7 @@ impl Server {
                 Ok((tcp_stream, user_addr)) => {
                     let user_id = self.get_next_user_id().await;
                     info!(%user_addr,%client_conn.socket_addr,user_id,assigned_port,"Accept user connection");
-                    let (mut user_read, user_write) = tcp_stream.into_split();
+                    let (user_read, user_write) = tcp_stream.into_split();
                     let user_conn = UserConn {
                         write_stream: user_write,
                         user_id,
@@ -121,7 +121,7 @@ impl Server {
                     // make the client establish a connection to their local stream
                     let mut client_write_mu = client_write.lock().await;
                     TunnelMessage::Data(TunnelMessageData { user_id, len: 0 })
-                        .write(&mut client_write_mu, &vec![])
+                        .write(&mut client_write_mu, &EMPTY_U8_VEC)
                         .await?;
                     // client_write_mu.write_u64(user_id).await?;
                     // client_write_mu.write_u64(0u64).await?;

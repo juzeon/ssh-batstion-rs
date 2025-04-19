@@ -7,11 +7,5 @@ use tracing::{error, info};
 #[tokio::main]
 pub async fn main() {
     init_tracing();
-    loop {
-        info!("Starting client");
-        if let Err(err) = Client::new().start_forwarding().await {
-            error!(%err,"Forwarding error");
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
+    Client::new().start_forwarding_forever().await
 }

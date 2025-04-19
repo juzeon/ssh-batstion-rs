@@ -1,6 +1,6 @@
 use anyhow::bail;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::Layer;
@@ -9,6 +9,7 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+pub static EMPTY_U8_VEC: Vec<u8> = vec![];
 pub fn init_tracing() {
     tracing_subscriber::registry()
         .with(
