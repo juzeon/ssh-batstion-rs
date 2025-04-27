@@ -137,16 +137,16 @@ impl Client {
     ) -> anyhow::Result<()> {
         let mut buf = vec![0; 1024];
         loop {
-            let n: anyhow::Result<usize>;
-            select! {
+            // let n: anyhow::Result<usize>;
+            let n = select! {
                 res=local_reader.read(&mut buf)=>{
-                    n=res.context("read failed")
+                    res.context("read failed")
                 }
                 _=cancel_token.cancelled()=>{
                     info!(user_id,"Exiting local stream because of cancel token");
                     break;
                 }
-            }
+            };
             let mut writer = self
                 .remote_write
                 .as_mut()

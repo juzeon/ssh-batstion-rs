@@ -103,16 +103,15 @@ impl Server {
 
         loop {
             let forward_listener_cancel_token_clone = forward_listener_cancel_token.clone();
-            let res;
-            select! {
+            let res = select! {
                 r=forward_listener.accept()=>{
-                    res=r;
+                    r
                 },
                 _=forward_listener_cancel_token_clone.cancelled()=>{
                     warn!("Exit forward listener because of forward_listener_cancel_token");
                     break;
                 }
-            }
+            };
             match res {
                 Ok((tcp_stream, user_addr)) => {
                     let user_id = self.get_next_user_id().await;
@@ -169,16 +168,16 @@ impl Server {
     ) -> anyhow::Result<()> {
         let mut buf = vec![0; 1024];
         loop {
-            let n: anyhow::Result<usize>;
-            select! {
+            // let n: anyhow::Result<usize>;
+            let n = select! {
                 a=user_read.read(&mut buf)=>{
-                    n=a.context("read failed");
+                    a.context("read failed")
                 },
                 _=cancel_token.cancelled()=>{
                     warn!(?user_id,"Exit user connection because the client has exited");
                     break;
                 }
-            }
+            };
             let mut client_write_mu = client_write.lock().await;
             let n = n.unwrap_or(0);
             if n == 0 {
