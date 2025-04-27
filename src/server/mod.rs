@@ -1,38 +1,32 @@
 pub mod types;
 
-use crate::server::types::{ClientConn, MySocketAddr, ServerConfig, UserConn};
+use crate::server::types::{ClientConn, ServerConfig, UserConn};
 use crate::types::{TunnelMessage, TunnelMessageClose, TunnelMessageData};
 use crate::util::{EMPTY_U8_VEC, load_config};
 use anyhow::{Context, bail};
 use rand::Rng;
 use std::collections::HashMap;
-use std::error::Error;
-use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
-use std::ptr::hash;
 use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::broadcast::Receiver;
-use tokio::sync::{Mutex, RwLock};
-use tokio::{net, select};
+use tokio::select;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, warn};
 
 pub static SERVER_CONFIG: LazyLock<ServerConfig> =
     LazyLock::new(|| load_config::<ServerConfig>().unwrap());
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Server {
     client_last_port: Arc<Mutex<HashMap<IpAddr, u16>>>,
     next_user_id: Arc<Mutex<u64>>,
 }
+
 impl Server {
     pub fn new() -> Server {
-        Server {
-            client_last_port: Default::default(),
-            next_user_id: Default::default(),
-        }
+        Server::default()
     }
     pub async fn start_listening(&self) -> anyhow::Result<()> {
         let port = SERVER_CONFIG.server_port;
@@ -83,7 +77,7 @@ impl Server {
         tokio::spawn(async move {
             if let Err(err) = self_clone
                 .tunnel_stream_to_user(
-                    client_conn.socket_addr.clone(),
+                    client_conn.socket_addr,
                     client_read,
                     user_conn_map_clone.clone(),
                 )

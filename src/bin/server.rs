@@ -1,5 +1,5 @@
-use ssh_bastion_rs::server::{SERVER_CONFIG, Server};
-use ssh_bastion_rs::util::{init_tracing, load_config};
+use ssh_bastion_rs::server::Server;
+use ssh_bastion_rs::util::init_tracing;
 use tracing::instrument;
 
 #[instrument]

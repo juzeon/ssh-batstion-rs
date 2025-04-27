@@ -7,7 +7,6 @@ use anyhow::Context;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -15,23 +14,20 @@ use tokio::select;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 pub static CLIENT_CONFIG: LazyLock<ClientConfig> =
     LazyLock::new(|| load_config::<ClientConfig>().unwrap());
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Client {
     remote_port: u16,
     local_stream_map: Arc<Mutex<HashMap<u64, LocalStream>>>,
     remote_write: Option<Arc<Mutex<OwnedWriteHalf>>>,
 }
+
 impl Client {
     pub fn new() -> Client {
-        Client {
-            remote_port: 0,
-            local_stream_map: Default::default(),
-            remote_write: None,
-        }
+        Client::default()
     }
     pub async fn start_forwarding_forever(&mut self) {
         loop {

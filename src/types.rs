@@ -18,7 +18,7 @@ pub struct TunnelMessageData {
 impl TunnelMessage {
     pub async fn read(
         stream: &mut OwnedReadHalf,
-        mut data: &mut Vec<u8>,
+        data: &mut Vec<u8>,
     ) -> anyhow::Result<TunnelMessage> {
         let inst = stream.read_u8().await?;
         let user_id = stream.read_u64().await?;
@@ -26,7 +26,7 @@ impl TunnelMessage {
             1 => {
                 let len = stream.read_u64().await?;
                 data.resize(len as usize, 0);
-                stream.read_exact(&mut data).await?;
+                stream.read_exact(data).await?;
                 Ok(Data(TunnelMessageData { user_id, len }))
             }
             2 => Ok(Close(TunnelMessageClose { user_id })),

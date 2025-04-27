@@ -1,4 +1,4 @@
-use ssh_bastion_rs::client::{CLIENT_CONFIG, Client};
+use ssh_bastion_rs::client::Client;
 use ssh_bastion_rs::util::init_tracing;
 
 #[tokio::main]

@@ -1,6 +1,6 @@
 use anyhow::bail;
 use serde::de::DeserializeOwned;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::Layer;
@@ -31,7 +31,6 @@ fn file_writer() -> impl std::io::Write {
     for path in paths {
         let f = OpenOptions::new()
             .append(true)
-            .write(true)
             .create(true)
             .open(path);
         match f {

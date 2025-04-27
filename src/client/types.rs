@@ -1,6 +1,5 @@
 use serde::Deserialize;
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
